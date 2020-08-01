@@ -674,6 +674,14 @@ private:
   SocketOptions socket_options_ = default_socket_options;
 };
 
+enum class Error {
+  NoError,
+  UnknownError,
+  ConnectionError,
+  ConnectionTimeoutError,
+  BindIPAddressError
+};
+
 class ClientImpl {
 public:
   explicit ClientImpl(const std::string &host);
@@ -687,6 +695,8 @@ public:
   virtual ~ClientImpl();
 
   virtual bool is_valid() const;
+
+  virtual Error get_last_error() const;
 
   std::shared_ptr<Response> Get(const char *path);
   std::shared_ptr<Response> Get(const char *path, const Headers &headers);
@@ -828,6 +838,9 @@ protected:
   bool process_request(Stream &strm, const Request &req, Response &res,
                        bool close_connection);
 
+  // Error state
+  mutable Error error_ = Error::NoError;
+
   // Socket endoint information
   const std::string host_;
   const int port_;
@@ -949,9 +962,11 @@ public:
                   const std::string &client_cert_path,
                   const std::string &client_key_path);
 
-  virtual ~Client();
+  ~Client();
 
-  virtual bool is_valid() const;
+  bool is_valid() const;
+
+  Error get_last_error() const;
 
   std::shared_ptr<Response> Get(const char *path);
   std::shared_ptr<Response> Get(const char *path, const Headers &headers);
@@ -1965,7 +1980,9 @@ inline socket_t create_client_socket(const char *host, int port,
                                      bool tcp_nodelay,
                                      SocketOptions socket_options,
                                      time_t timeout_sec, time_t timeout_usec,
-                                     const std::string &intf) {
+                                     const std::string &intf, Error &error) {
+  error = Error::ConnectionError;
+
   return create_socket(
       host, port, 0, tcp_nodelay, socket_options,
       [&](socket_t sock, struct addrinfo &ai) -> bool {
@@ -1973,7 +1990,10 @@ inline socket_t create_client_socket(const char *host, int port,
 #ifndef _WIN32
           auto ip = if2ip(intf);
           if (ip.empty()) { ip = intf; }
-          if (!bind_ip_address(sock, ip.c_str())) { return false; }
+          if (!bind_ip_address(sock, ip.c_str())) {
+            error = Error::BindIPAddressError;
+            return false;
+          }
 #endif
         }
 
@@ -1981,15 +2001,23 @@ inline socket_t create_client_socket(const char *host, int port,
 
         auto ret =
             ::connect(sock, ai.ai_addr, static_cast<socklen_t>(ai.ai_addrlen));
+
         if (ret < 0) {
-          if (is_connection_error() ||
-              !wait_until_socket_is_ready(sock, timeout_sec, timeout_usec)) {
+          if (is_connection_error()) {
             close_socket(sock);
+            error = Error::ConnectionError;
+            return false;
+          }
+
+          if (!wait_until_socket_is_ready(sock, timeout_sec, timeout_usec)) {
+            close_socket(sock);
+            error = Error::ConnectionTimeoutError;
             return false;
           }
         }
 
         set_nonblocking(sock, false);
+        error = Error::NoError;
         return true;
       });
 }
@@ -3330,7 +3358,7 @@ make_basic_authentication_header(const std::string &username,
 
 inline std::pair<std::string, std::string>
 make_bearer_token_authentication_header(const std::string &token,
-                                 bool is_proxy = false) {
+                                        bool is_proxy = false) {
   auto field = "Bearer " + token;
   auto key = is_proxy ? "Proxy-Authorization" : "Authorization";
   return std::make_pair(key, field);
@@ -4524,15 +4552,17 @@ inline ClientImpl::~ClientImpl() { stop(); }
 
 inline bool ClientImpl::is_valid() const { return true; }
 
+inline Error ClientImpl::get_last_error() const { return error_; }
+
 inline socket_t ClientImpl::create_client_socket() const {
   if (!proxy_host_.empty()) {
     return detail::create_client_socket(
         proxy_host_.c_str(), proxy_port_, tcp_nodelay_, socket_options_,
-        connection_timeout_sec_, connection_timeout_usec_, interface_);
+        connection_timeout_sec_, connection_timeout_usec_, interface_, error_);
   }
-  return detail::create_client_socket(host_.c_str(), port_, tcp_nodelay_,
-                                      socket_options_, connection_timeout_sec_,
-                                      connection_timeout_usec_, interface_);
+  return detail::create_client_socket(
+      host_.c_str(), port_, tcp_nodelay_, socket_options_,
+      connection_timeout_sec_, connection_timeout_usec_, interface_, error_);
 }
 
 inline bool ClientImpl::create_and_connect_socket(Socket &socket) {
@@ -4572,6 +4602,8 @@ inline bool ClientImpl::read_response_line(Stream &strm, Response &res) {
 inline bool ClientImpl::send(const Request &req, Response &res) {
   std::lock_guard<std::recursive_mutex> request_mutex_guard(request_mutex_);
 
+  error_ = Error::UnknownError;
+
   {
     std::lock_guard<std::mutex> guard(socket_mutex_);
 
@@ -4591,6 +4623,7 @@ inline bool ClientImpl::send(const Request &req, Response &res) {
         if (!proxy_host_.empty()) {
           bool success = false;
           if (!scli.connect_with_proxy(socket_, res, success)) {
+            if (success) { error_ = Error::NoError; }
             return success;
           }
         }
@@ -4609,6 +4642,7 @@ inline bool ClientImpl::send(const Request &req, Response &res) {
 
   if (close_connection || !ret) { stop(); }
 
+  if (ret) { error_ = Error::NoError; }
   return ret;
 }
 
@@ -4831,6 +4865,9 @@ inline std::shared_ptr<Response> ClientImpl::send_with_content_provider(
     const char *method, const char *path, const Headers &headers,
     const std::string &body, size_t content_length,
     ContentProvider content_provider, const char *content_type) {
+
+  error_ = Error::UnknownError;
+
   Request req;
   req.method = method;
   req.headers = headers;
@@ -6009,6 +6046,10 @@ inline Client::~Client() {}
 
 inline bool Client::is_valid() const {
   return cli_ != nullptr && cli_->is_valid();
+}
+
+inline Error Client::get_last_error() const {
+  return is_valid() ? cli_->get_last_error() : Error::UnknownError;
 }
 
 inline std::shared_ptr<Response> Client::Get(const char *path) {
